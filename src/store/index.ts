@@ -1,51 +1,110 @@
-export * as actions from "./actions";
+import { proxy, subscribe, useSnapshot } from "valtio";
+import { devtools } from "valtio/utils";
 
-// export class Global {
-//     static messages: Message[] = [];
-//     static USER_SETTINGS: Setting = {};
-// }
-// 通过定义一个export default的类，是不是既可以保留const(普通对象内部无法const)，又可以重新赋值property(顶层导出变量会readonly, 无法重新赋值)?
-// 普通对象内部确实无法const，不过可以在这个对象的interface中readonly，但是这样要声明两次，不如直接class配合static一步到位
-// 导出class，绑定到vue的data中，并不能响应式(自动同步变量)，而object的导出可以，那就object吧
-// 直接new一个Vue实例作为event bus也是可以的，但是不想被框架绑架
+import logger, { IRecord } from "../utils/logger";
+import { setValue } from "../utils/polyfill";
+import { IWELearnSettings, SectionSetting } from "../utils/setting";
+import { ICommonSettings } from "../utils/setting/common";
 
+class Store {
+    visibility = {
+        log: true,
+        config: false,
+        floating: false,
+    };
+    setVisibility(key: keyof typeof this.visibility, value: boolean) {
+        this.visibility[key] = value;
+    }
+    position = {
+        floating: {
+            x: 0,
+            y: 0,
+        },
+        log: {
+            x: 0,
+            y: 0,
+        },
+    };
+    setPosition(key: keyof typeof this.position, value: any) {
+        this.position[key] = value;
+    }
 
-interface GlobalState {
-    /**所有要展示的消息*/
-    messages: Message[];
-    /**所有全局设置*/
-    USER_SETTINGS: UserSettings;
-    /**悬浮窗的折叠控制*/
-    collapse: boolean;
-    /**是否显示与考试相关的按钮*/
-    showExamQueryButton: boolean;
-    /**是否显示上传答案按钮*/
-    showExamUploadButton: boolean;
-    // [propName: string]: any;
+    tabIndex: number = 0;
+    setTabIndex(index: number) {
+        this.tabIndex = index;
+    }
+
+    userSettings = {} as IWELearnSettings & ICommonSettings;
+    sectionSettings: SectionSetting<IWELearnSettings & ICommonSettings>[] = [];
+
+    /** 因为subscribe了这个key，如果直接替换(=)，会导致subscribe失效 */
+    setUserSettings(userSettings: Partial<IWELearnSettings & ICommonSettings>) {
+        for (const [key, value] of Object.entries(userSettings || {})) {
+            // @ts-ignore
+            this.userSettings[key] = value;
+        }
+    }
+
+    /**
+     * 通过集成了所有插件设置的设置中心，设置USER_SETTINGS的默认值
+     */
+    setDefaultValues() {
+        for (const section of this.sectionSettings) {
+            for (const generic of section.settings) {
+                if (this.userSettings[generic.id] === undefined) {
+                    // @ts-ignore
+                    this.userSettings[generic.id] = generic.default;
+                }
+            }
+        }
+    }
+
+    /** 恢复默认值 */
+    resetDefaultValues() {
+        for (const section of this.sectionSettings) {
+            for (const generic of section.settings) {
+                // @ts-ignore
+                this.userSettings[generic.id] = generic.default;
+            }
+        }
+    }
+
+    logs: IRecord[] = [];
+    clearLogs(remain?: number) {
+        if (remain) {
+            this.logs = this.logs.slice(0, remain);
+        } else {
+            this.logs = [];
+        }
+    }
+    getRecordById(id: string) {
+        return this.logs.find((record) => record.id === id);
+    }
+    // 不知道是不是因为是proxy，所以这个方法不起作用
+    // updateRecord(record: Pick<IRecord, "id"> & Partial<IRecord>) {
+    //     const index = this.logs.findIndex((log) => log.id === record.id);
+    //     if (index !== -1) {
+    //         logger.debug("in updateRecord", record)
+
+    //         this.logs[index] = { ...this.logs[index], ...record };
+    //     }
+    // }
 }
 
-export let store: GlobalState = {
-    messages: [],
-    USER_SETTINGS: {} as UserSettings,
-    collapse: false,
-    showExamQueryButton: false,
-    showExamUploadButton: false,
-};
+export const store = proxy(new Store());
 
-// *--------------------以下为常量
-export let BASE_URL: string | null;
-export let DEBUG_MODE: boolean;
+export const useStore = () => useSnapshot(store);
 
-if (process.env.NODE_ENV === "development") {
-    // BASE_URL = "http://localhost:53212/api/welearn";
-    BASE_URL = "http://47.100.166.53/api/welearn";
-    DEBUG_MODE = true;
-} else {
-    BASE_URL = "http://47.100.166.53/api/welearn";
-    DEBUG_MODE = false;
-}
+devtools(store, {
+    name: "store",
+});
 
-import * as PACKAGE from "../../package.json";
+subscribe(store.userSettings, async () => {
+    await setValue("userSettings", store.userSettings);
+    logger.debug("userSettings已持久化");
+});
 
-export const VERSION = PACKAGE.version;
-export const QUERY_INTERVAL = 3000; //单位ms
+export const CONSTANT = {
+    QUERY_INTERVAL: 2000,
+    DEBUG_MODE: false,
+} as const;

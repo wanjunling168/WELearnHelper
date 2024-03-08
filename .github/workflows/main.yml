@@ -1,0 +1,205 @@
+name: 自动发布
+
+on:
+  - push
+  - workflow_dispatch
+
+jobs:
+  metadata:
+    name: 根据metadata，修改package.json
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Setup Python # Set Python version
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: pip install python-dotenv
+
+      - name: 修改package.json
+        run: python ./scripts/version.py
+
+      - name: Commit changes
+        uses: EndBug/add-and-commit@v9
+        with:
+          default_author: github_actions
+          message: "根据metadata自动修改package.json的版本"
+          add: "package.json"
+
+  check:
+    name: 检查是否有新版本
+    runs-on: ubuntu-latest
+
+    needs: [metadata]
+    # 手动触发时，diff-search会失败
+    # release对这个是依赖关系，所以不能是job级的If
+    # if: github.event_name == 'push'
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 50
+
+      - name: Check if version has been updated
+        if: github.event_name == 'push'
+        id: check
+        uses: EndBug/version-check@v2
+        with:
+          # 这个也需要通过历史commit判断，所以多checkout一些commit
+          diff-search: true
+
+      - name: Log when changed
+        if: github.event_name == 'push' && steps.check.outputs.changed == 'true'
+        run: >
+          echo "Version change found in commit ${{ steps.check.outputs.commit }}! 
+          New version: ${{ steps.check.outputs.version }} (${{ steps.check.outputs.type }})"
+
+      - name: get-npm-version
+        if: github.event_name == 'workflow_dispatch'
+        id: package-version
+        uses: martinbeentjes/npm-get-version-action@main
+
+    outputs:
+      hasNewVersion: ${{ steps.check.outputs.changed || false }}
+      newVersion: ${{ steps.check.outputs.version || steps.package-version.outputs.current-version }}
+
+  release:
+    name: 自动release
+    runs-on: ubuntu-latest
+
+    needs: [check]
+    # EndBug的check version似乎只能检查最近的一个commit，所以需要允许用workflow_dispatch来主动触发
+    if: needs.check.outputs.hasNewVersion == 'true' || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 50
+
+      - name: Setup Node
+        uses: actions/setup-node@v3
+        with:
+          node-version: 18
+
+      - name: Install dependencies
+        uses: pnpm/action-setup@v2
+        with:
+          # https://github.com/pnpm/action-setup/issues/40
+          version: 7
+          run_install: false
+
+      - name: Get pnpm store directory
+        id: pnpm-cache
+        shell: bash
+        run: |
+          echo "STORE_PATH=$(pnpm store path)" >> $GITHUB_OUTPUT
+
+      - uses: actions/cache@v3
+        name: Setup pnpm cache
+        with:
+          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: 打包userscript
+        run: pnpm run build:js
+
+      - name: 发布userscript
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ needs.check.outputs.newVersion }}
+          files: ./dist/*.js
+
+      # 发布extension
+      - name: build extension
+        run: pnpm run build:crx
+
+      - name: Setup Python # Set Python version
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: pip install python-dotenv
+
+      # 生成并移动manifest.json、icon.png
+      - name: 生成manifest.json
+        run: |
+          python ./scripts/manifest.py
+          mv ./scripts/manifest.json ./dist/manifest.json
+
+      - name: zip
+        run: python ./scripts/zip.py
+
+      - name: 发布extension
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ needs.check.outputs.newVersion }}
+          files: ./dist/*.zip
+
+      # 只能获取到version，获取不到具体的内容，
+      # 因为checkout默认只fetch 最新的commit，而需要从历史commit中提取message
+      - name: 自动生成release note
+        run: |
+          pnpm install -g conventional-changelog-cli
+          conventional-changelog -p conventionalcommits -o temp.md -r 1
+          conventional-changelog -p conventionalcommits -i ./docs/CHANGELOG.md -s -r 1 -a
+          cat temp.md
+
+      # - name: Conventional Changelog Action
+      #   id: changelog
+      #   uses: TriPSs/conventional-changelog-action@v3
+      #   with:
+      #     output-file: "false"
+      #     preset: "conventionalcommits"
+      #     # 如果有feat，就会minor，我还是希望手动控制
+      #     skip-commit: "true"
+      #     # Do not update the version file.(package.json)
+      #     skip-version-file: "true"
+      #     # Do not tag the release
+      #     skip-tag: "true"
+
+      # - run: |
+      #     echo "changelog: ${{ steps.changelog.outputs.changelog }}"
+      #     echo "clean_changelog: ${{ steps.changelog.outputs.clean_changelog }}"
+      #     echo "version: ${{ steps.changelog.outputs.version }}"
+      #     echo "tag: ${{ steps.changelog.outputs.tag }}"
+      #     echo "skipped: ${{ steps.changelog.outputs.skipped }}"
+
+      - name: 发布生成的release note
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ needs.check.outputs.newVersion }}
+          body_path: temp.md
+          # body: ${{ steps.changelog.outputs.clean_changelog }}
+
+  sync:
+    name: 同步release到专门的repo中，方便第三方进行webhook
+    runs-on: ubuntu-latest
+
+    needs: [release]
+
+    steps:
+      - name: 同步release到专门的repo中，方便第三方进行webhook
+        uses: actions/github-script@v6
+        with:
+          # 自带的github-token不够权限，需要自己创建一个
+          github-token: ${{ secrets.TOKEN }}
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: 'SSmJaE',
+              repo: 'MyUserScripts',
+              workflow_id: 'main.yml',
+              ref: 'master'
+            })
